@@ -29,7 +29,8 @@ Bandwidth ranges cover all ranks, using timings that include issue and drain but
 - An even number of ranks for multi-rank communication.
 - CANN with Ascend C, the Bisheng compiler, HCCL and HCOMM headers/libraries.
 - Python 3.10 or newer, a matching PyTorch/`torch_npu` installation, and NumPy for the tests.
-- A C++20 compiler and standard library supporting `std::format`.
+- A C++20 compiler and standard library supporting `std::format`. For GCC/libstdc++, use GCC 13 or newer with matching development headers and runtime libraries ([GCC 13 release notes](https://gcc.gnu.org/gcc-13/changes.html)).
+- elfutils development headers, including `elfutils/libdwfl.h`, for DeepJIT's host-side exception handling.
 
 The validated stack is Ascend 950DT, CANN 9.2.0, Python 3.12, PyTorch 2.13.0+cpu and torch_npu 2.13.0rc1, with the PoC HDK configuration described below. Kernel support on other Ascend generations or CANN versions has not been established by these measurements.
 
@@ -42,6 +43,29 @@ Use Huawei's Q3 commercial HDK release for Atlas 850E when it becomes publicly a
 The performance results in this README were collected using a PoC HDK supplied to DeepSeek, with additional manual configuration. That configuration is not a publicly distributed release. Users on earlier PoC versions may observe lower bandwidth and should first check their HDK version and configuration. Use the Q3 commercial release, once available, as the recommended public deployment baseline; these measurements are not results from that unreleased commercial version.
 
 ### Installation
+
+Install the elfutils development packages in the host or container where you build the extension. On Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libdw-dev libelf-dev
+```
+
+On openEuler/Fedora/RHEL, use the corresponding packages:
+
+```bash
+sudo dnf install -y elfutils-devel elfutils-libelf-devel
+```
+
+On openEuler 24.03 LTS SP4, enable [GCC Toolset 14](https://docs.openeuler.org/zh/docs/25.03/server/development/gcc/gcc-14-secondary-version-compilation-toolchain-user-guide.html) for C++20 `<format>` support. The C++ package in the [SP4 aarch64 repository](https://repo.openeuler.org/openEuler-24.03-LTS-SP4/everything/aarch64/Packages/) is named `gcc-toolset-14-gcc-c++`:
+
+```bash
+sudo dnf install -y gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
+    gcc-toolset-14-binutils gcc-toolset-14-libstdc++-devel
+source /opt/openEuler/gcc-toolset-14/enable
+export CC=/opt/openEuler/gcc-toolset-14/root/usr/bin/gcc
+export CXX=/opt/openEuler/gcc-toolset-14/root/usr/bin/g++
+```
 
 Activate the CANN environment and install the matching PyTorch/`torch_npu` packages first, then:
 
@@ -63,7 +87,8 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues; opt-in low-latency BF16/FP16/FP8 dispatch and BF16/FP16 combine |
+| `DecodeBuffer` | BF16 decode with automatic kernel selection by actual per-rank token count and EP size; one weighted-combine contract across both implementations |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -194,6 +219,252 @@ output, _ = pending.wait()
 ```
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
+
+## Automatic decode dispatch/combine
+
+Use `DecodeBuffer` for a BF16 decode workflow without selecting a communication
+backend. Expert outputs must be **unweighted**: `combine` applies the weights
+provided at dispatch exactly once on either implementation.
+
+```python
+from deep_ep import DecodeBuffer
+
+buffer = DecodeBuffer(ep_group, num_max_tokens_per_rank=256,
+                      hidden=7168, num_topk=8, num_experts=128)
+recv_x, handle, event = buffer.dispatch(x, topk_idx, topk_weights)
+event.wait()
+expert_output = local_experts_without_routing_weights(recv_x, handle.expert_recv_counts)
+output, event = buffer.combine(expert_output, handle)
+event.wait()
+buffer.destroy()  # Collective; before destroying the process group.
+```
+
+The initial policy uses the balanced A5 BF16 communication-kernel measurements
+for H=7168, K=8, E=128, 32 AI cores:
+
+| EP | Actual tokens per rank selecting decode kernels | Otherwise |
+| --- | --- | --- |
+| 8 | 1–64 | Throughput kernels |
+| 16, 32, 64, 128 | 1–32 | Throughput kernels |
+| Other EP sizes or model shapes | None | Throughput kernels |
+
+The endpoints are conservative thresholds between measured BS points, not a
+claim that every intermediate BS has been benchmarked. Selection also checks
+the device and both native dispatch/combine capacity plans. Rejected plans use
+throughput kernels **before launch**; allocation or communication failures are
+never retried on another backend. FP16/FP8 are not accepted by this BF16 adapter;
+the explicit `EPBuffer` APIs remain available for those workflows.
+
+Both paths expose contiguous expert-major rows with alignment 1, int64 device
+counts, and the same opaque `DecodeHandle`. Only the leading sum(counts) rows
+are valid; use device counts for grouped GEMM. `do_cpu_sync=True` additionally
+returns exact-sized output and populates `handle.num_recv_tokens_per_expert_list`.
+Combine follows the handle's originating implementation even after batch size
+changes. Repeated combine does not modify expert outputs or saved weights.
+`handle.backend` is available for diagnostics only.
+
+All ranks must use identical shapes/options and collective call order on
+homogeneous devices. Routes must be valid, distinct expert IDs per token, with
+contiguous int64 indices and FP32 weights on the current NPU. The adapter does
+not add a host agreement collective or inspect device route values. These
+requirements apply to both selected implementations. Input readiness across
+streams remains the caller's responsibility; the adapter orders its own work.
+
+Each arena is allocated collectively on first use and then retained; the decode
+arena reserves 8 GiB per rank plus workspace, and switching between implementations
+can retain both arenas. Warm up each required shape before timing. Graph capture
+is not supported. The throughput path applies weights to expert outputs before
+its unweighted combine, which introduces the normal BF16 intermediate rounding
+and adapter work. The measured kernel speedups do not include that work,
+allocation, JIT, or Python overhead and are not end-to-end speedup guarantees.
+
+Existing `EPBuffer.dispatch/combine` semantics are unchanged: their returned
+weights are transported metadata, whereas explicit LL combine applies dispatch
+weights. Use `DecodeBuffer` when this difference should be handled internally.
+
+Validation (run the NPU test only after checking all participating nodes idle):
+
+```bash
+python tests/ep/test_decode_host.py
+python tests/ep/test_decode.py --num-processes 8 --bs 2 32 64 128 2
+```
+
+The NPU test covers both count modes, random/concentrated routes, weighted
+correctness, repeated combine, stream changes, backend transitions, and reuse
+of a handle after switching backends. For multiple nodes, use the same
+`MASTER_ADDR`/`MASTER_PORT`, set `WORLD_SIZE` to the **node count**, and run once
+per node with its node-index `RANK`, as for `test_ep.py`.
+
+## Low-latency dispatch/combine (Ascend 950/A5)
+
+Set `low_latency_mode=True` to select the decode kernels synchronized with
+[Ascend/DeepEP `8ffafeb`](https://gitcode.com/Ascend/DeepEP/commit/8ffafebc0bf812e8479fda5139333bdd71c38a34)
+(2026-10-08). The kernels use this repository's
+HCCL/UBMEM peer mappings and DeepJIT; SHMEM and the source repository are not
+runtime dependencies. The default throughput path is unchanged.
+
+The migration adds EP8 support: an eight-rank group uses the direct paths within
+one logical server. EP16/32/64/128/256 retain the source protocol. Dispatch and
+combine select the direct path when `num_max_tokens_per_rank <= 32`, and server
+deduplication above 32. This decision uses the dispatch capacity saved in its
+handle, not the actual batch size or a later dispatch's capacity.
+The sync includes compact packet receives, 512-byte count slots, rank-biased
+peer buffers and interleaved server traversal at EP128 and above.
+The BF16 path has been exercised on A5 at EP8/16/32/64/128, including the
+balanced communication-kernel matrix used for automatic selection above.
+`DecodeBuffer` additionally passes EP8/EP16 correctness and backend-transition
+tests. Other dtypes and shapes require their own target-host validation.
+
+```python
+buffer = EPBuffer(
+    ep_group, num_max_tokens_per_rank=16, hidden=7168, num_topk=8,
+    low_latency_mode=True, explicitly_destroy=True,
+)
+recv_x, _, _, handle, event = buffer.dispatch(
+    x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=128,
+    do_expand=True, do_cpu_sync=False,
+)
+event.wait()
+# Only the leading sum(handle.expert_recv_counts) rows are valid. Rows are
+# grouped by local expert; device counts let a grouped GEMM skip unused rows.
+expert_output = local_experts_without_routing_weights(recv_x, handle.expert_recv_counts)
+output, _, event = buffer.combine(expert_output, handle)
+event.wait()
+# After all uses have completed, collectively destroy before the process group.
+buffer.destroy()
+```
+
+Low-latency contracts:
+
+- Ascend 950/A5 (`dav-3510`), 64 AIVs, EP8/16/32/64/128/256, direct UBMEM connectivity
+  between every pair of ranks. All ranks use identical B/M/H/K/E and collective order.
+- At least 190 KiB usable UB per vector core. The combine receive arena uses
+  the CANN-reported capacity, aligned down to 32 bytes and capped at 240 KiB.
+  Host validation and device tiling use that same budget; smaller arenas reduce
+  buffering lanes and can reject larger hidden sizes. Rebuild the host extension
+  together with the packaged JIT headers when updating this layout.
+- `0 < B <= num_max_tokens_per_rank <= 256`, `1 <= K <= 32`, `E <= 1024`, and E
+  divisible by EP. Native layout checks additionally enforce UB/window limits.
+  Worst-case received rows `EP * B * min(K, E / EP)` must not exceed 10000.
+- Exactly 8 GiB of logical communication storage per rank, plus a 2 MiB barrier
+  workspace and 2 MiB padding for the `rank * 1024` byte arena offset.
+  `EPBuffer.get_buffer_size_hint(..., low_latency_mode=True)` returns
+  the communication-storage size. The allocator may round huge-page allocations.
+- Expanded layout, expert alignment 1, contiguous NPU tensors. Routes are int64,
+  must be in `[0, E)`, and have no repeated expert within a token's top-k.
+  Masked (`-1`) and duplicate routes are unsupported by these LL kernels.
+  Dispatch requires FP32 weights. Combine applies those saved weights exactly
+  once; expert outputs must be unweighted. Returned dispatch indices and weights
+  are `None`. Combine does not accept additional weights or bias.
+- BF16/FP16 inputs, or `(FP8 E4M3FN, scales)` with scales shaped `[B, ceil(H/128)]`:
+  INT32 packs of four E8M0 per-32 scales, or FP32 per-128 scales. Scale bytes are
+  transported unchanged. These scale packs differ from the throughput path's
+  INT16 format. FP8 dispatch combines BF16 or FP16 expert outputs.
+- `do_cpu_sync=True` (the default) reads kernel-produced expert counts and trims
+  output to the exact received rows. With `False`, output retains worst-case
+  capacity based on actual B, and counts remain on the device in
+  `handle.expert_recv_counts`. `do_zero_padding=True` clears unused output rows.
+- Complete kernels run on the current stream. An internal event serializes
+  calls when the current stream changes. Handles can be reused for combine;
+  cached dispatch, deterministic sorting, expert padding, deferred epilogues,
+  handle copying and load-balancing stats/storage are unsupported in this mode.
+  `num_sms` is 0 or 32. No unsupported option silently falls back to throughput.
+
+### Single-host, 8-NPU test commands
+
+Run on the Linux Ascend host, after activating its CANN environment and matching
+PyTorch/torch_npu installation. Build and test from this repository:
+
+```bash
+cd /path/to/DeepEP-Ascend
+git submodule update --init --recursive third-party/deep_jit
+# Build and link the matching native extension into this source checkout.
+# Select the host compiler as described under Installation first.
+bash -e develop.sh
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+# Check for a stale native extension from another installation.
+python - <<'PY'
+from pathlib import Path
+import torch_npu
+import deep_ep
+from deep_ep import _C
+
+root = Path.cwd().resolve()
+for module in (deep_ep, _C):
+    path = Path(module.__file__).resolve()
+    print(f'{module.__name__}: {path}')
+    assert path.is_relative_to(root), f'Loaded another DeepEP installation: {path}'
+PY
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export WORLD_SIZE=1 RANK=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=48360
+export HCCL_IF_BASE_PORT=48361 TASK_QUEUE_ENABLE=0
+export EP_JIT_LAUNCH_TIMEOUT=300
+
+# EP8 smoke test: BF16, three dispatch rounds and repeated combine.
+python tests/ep/test_low_latency.py --num-processes 8 \
+    --num-tokens 16 --hidden 7168 --num-topk 8 --num-experts 128 \
+    --dtype bf16 --test-first-only --skip-perf-test
+
+# Correctness matrix: both count modes, random/hotspot routes and FP8 scale formats.
+python tests/ep/test_low_latency.py --num-processes 8 \
+    --num-tokens 8 16 32 --hidden 7168 --num-topk 8 --num-experts 128 \
+    --dtype bf16 fp16 fp8 --fp8-scale-dtype int32 float32 \
+    --do-cpu-sync 0 1 --skip-perf-test
+
+# Keep B fixed and switch direct/dedup paths in the same buffer, including M=256.
+python tests/ep/test_low_latency.py --num-processes 8 \
+    --num-tokens 16 --num-max-tokens-per-rank 32 33 256 \
+    --hidden 7168 --num-topk 8 --num-experts 128 \
+    --dtype bf16 fp16 fp8 --fp8-scale-dtype int32 float32 \
+    --do-cpu-sync 0 1 --skip-perf-test
+
+# Public-call latency on the NPU stream, after warmup; slowest rank mean.
+python tests/ep/test_low_latency.py --num-processes 8 \
+    --num-tokens 16 --hidden 7168 --num-topk 8 --num-experts 128 \
+    --dtype bf16 fp8 --route random --do-cpu-sync 0 --warmup 10 --num-iters 50
+```
+
+`WORLD_SIZE` is the number of nodes and `RANK` is the node index for this launcher;
+it spawns eight local workers itself. Do not wrap the command in `torchrun`.
+The first call compiles device kernels. If the host has no 1-GiB huge-page pool,
+add `--no-huge1g-page`. Timing reports `dispatch_api_us` and `combine_api_us`:
+these include the Python adapter's queued work and are not isolated kernel timings.
+The test defaults M to each case's B; pass `--num-max-tokens-per-rank` to test
+different capacities. Add `--plan` to inspect any matrix without importing Torch.
+
+Host-only checks can run before installing Torch or CANN:
+
+```bash
+python tests/ep/test_low_latency_host.py
+python tests/ep/test_low_latency.py --num-processes 8 --plan
+c++ -std=c++17 -Ideep_ep/include tests/ep/low_latency_layout_test.cpp -o /tmp/deepep-ll-layout
+/tmp/deepep-ll-layout
+```
+
+Imported headers retain their notices. The synchronized source's BSD license is
+in [third-party/ascend-deepep.LICENSE](third-party/ascend-deepep.LICENSE); the earlier
+CANN notice is retained at [third-party/cann.LICENSE](third-party/cann.LICENSE).
+
+### Upstream test cases at `8ffafeb`
+
+These are source-repository test entry points; they use its ElasticBuffer/SHMEM
+runtime. Use `tests/ep/test_low_latency.py` above for this port's HCCL/DeepJIT path.
+
+| Upstream entry | Cases |
+| --- | --- |
+| `tests/elastic/test_ep_low_latency.py` | LL valid unique random routes (`normal`); BF16/FP16/FP8, both count modes, INT32/FP32 FP8 scales, repeated combine and profiler kernel timing. Its launcher accepts EP16/32/64/128/256 and `0 < B <= M <= 256`; EP8 is provided by this port. |
+| `tests/elastic/config_ll.example.json` | 144 combinations: B=8/16/32, dtype=BF16/FP16/FP8, E=64/128, H=4096/7168, K=4/8, CPU sync=0/1; default INT32 scales and two hosts of eight ranks. |
+| `tests/elastic/test_notify.py`, `test_dispatch.py` | HT normal/random/duplicates/invalid/empty/hotspot routes; dispatch checks BF16/FP8, metadata and cached calls. |
+| `tests/elastic/test_combine.py` | HT normal/random/duplicates/invalid/empty/local_duplicates/local_experts; optional `sq_pressure`, repeated calls, weight return, token-count and chunk-size matrices (256/512/1024). |
+| `tests/elastic/test_low_latency_host.py`, `test_ll_st_contract.py` | LL host API, launch/capacity contracts, independent references and profiler statistics. |
+| `tests/api`, `tests/runtime`, `tests/integration`, `tests/test_reference.py`, `tests/test_precision.py` | API/build/lifecycle checks, CPU/NPU reference adapters, Golden and precision tests. |
+| `experiments/megamoe/tests`, `experiments/ep_gmm_fused/tests` | Experimental fused-compute API, reference, packaging and measurement tests. |
+
+The upstream JSON is a matrix example, not evidence that every case passed on
+this port. See the [upstream test guide](https://gitcode.com/Ascend/DeepEP/blob/8ffafebc0bf812e8479fda5139333bdd71c38a34/tests/README.md)
+and [LL launcher](https://gitcode.com/Ascend/DeepEP/blob/8ffafebc0bf812e8479fda5139333bdd71c38a34/tests/elastic/test_ep_low_latency.py).
 
 ## Other buffer interfaces
 

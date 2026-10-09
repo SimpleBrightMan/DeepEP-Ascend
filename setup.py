@@ -169,9 +169,11 @@ if __name__ == '__main__':
     setuptools.setup(
         name='deep_ep',
         version=get_package_version(),
+        license_files=['third-party/cann.LICENSE', 'third-party/ascend-deepep.LICENSE'],
         packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
         # Older setuptools versions do not expand recursive package-data globs.
-        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*.hpp')]},
+        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
+                                 if path.suffix in ('.hpp', '.h')]},
         ext_modules=[ext_module],
         cmdclass={'build_ext': BuildExtension, 'build_py': CustomBuildPy},
     )
